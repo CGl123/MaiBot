@@ -55,6 +55,8 @@ MAISAKA_IMAGE_MAX_SIDE = 4096
 MAISAKA_IMAGE_ASPECT_RATIO_LIMIT = 3.0
 # 分割段之间的重叠像素，避免文字在分割边界被切断（按一般字体大小 16px 的 1.5 倍处理）。
 MAISAKA_IMAGE_SEGMENT_OVERLAP = 24
+# 单张图片分割的最大段数，超过时改为整体缩放，避免极长图片产生过多分段。
+MAISAKA_IMAGE_MAX_SEGMENTS = 10
 
 
 def _guess_image_format(image_bytes: bytes) -> Optional[str]:
@@ -95,6 +97,13 @@ def _normalize_maisaka_image(image_bytes: bytes, image_format: str) -> list[tupl
             aspect_ratio = max(width, height) / min(width, height)
             if aspect_ratio > MAISAKA_IMAGE_ASPECT_RATIO_LIMIT:
                 segments = _split_maisaka_image(image, width, height)
+                # 极长图片分割段数过多时，改为整体缩放，避免产生过多分段。
+                if len(segments) > MAISAKA_IMAGE_MAX_SEGMENTS:
+                    logger.info(
+                        f"Maisaka 图片分割段数 {len(segments)} 超过上限 {MAISAKA_IMAGE_MAX_SEGMENTS}，"
+                        f"改为整体缩放: {width}x{height}"
+                    )
+                    segments = [_resize_maisaka_image(image)]
             else:
                 segments = [image.copy()]
 
@@ -102,7 +111,7 @@ def _normalize_maisaka_image(image_bytes: bytes, image_format: str) -> list[tupl
             for segment in segments:
                 segment = _resize_maisaka_image(segment)
                 output_buffer = BytesIO()
-                if segment.mode in ("RGBA", "LA", "P"):
+                if segment.mode in ("RGBA", "LA", "P", "I;16"):
                     segment = segment.convert("RGB")
                 segment.save(output_buffer, format="JPEG", quality=95, optimize=True)
                 normalized_segments.append(("jpeg", base64.b64encode(output_buffer.getvalue()).decode("utf-8")))

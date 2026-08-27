@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import datetime
+from typing import Callable
 import base64
 import io
 
@@ -11,6 +12,7 @@ from src.common.logger import get_logger
 from src.config.model_configs import ModelInfo
 from src.llm_models.payload_content.context_item import (
     AssistantMessageItem,
+    ContextContentPart,
     ContextImagePart,
     ContextItem,
     ContextTextPart,
@@ -26,6 +28,30 @@ IMAGE_TEXT_PLACEHOLDER = "[图片]"
 """图片被替换为纯文本时的占位符。"""
 
 
+def _rebuild_item_with_image_transform(
+    item: ContextItem,
+    transform: Callable[[ContextImagePart], ContextContentPart],
+) -> ContextItem:
+    """重建含图片的消息 Item，并只清除被修改 Item 自身的 replay fragment。
+
+    Args:
+        item: 待重建的上下文 Item。
+        transform: 将图片片段转换为新片段的函数。
+
+    Returns:
+        ContextItem: 重建后的 Item；不含图片或类型不支持时原样返回。
+    """
+    if not isinstance(item, (SystemMessageItem, UserMessageItem, AssistantMessageItem)):
+        return item
+    if not any(isinstance(part, ContextImagePart) for part in item.parts):
+        return item
+
+    new_parts = tuple(transform(part) if isinstance(part, ContextImagePart) else part for part in item.parts)
+    if isinstance(item, AssistantMessageItem):
+        return replace(item, parts=new_parts, replay=None)
+    return replace(item, parts=new_parts)
+
+
 def replace_images_with_text(items: list[ContextItem]) -> list[ContextItem]:
     """将消息列表中的图片片段替换为纯文本占位符。
 
@@ -35,24 +61,9 @@ def replace_images_with_text(items: list[ContextItem]) -> list[ContextItem]:
     :param items: 消息列表
     :return: 图片被替换为文本占位符后的消息列表
     """
-
-    def rebuild_item_with_text_images(item: ContextItem) -> ContextItem:
-        """重建含图片的消息 Item，并只清除被修改 Item 自身的 replay fragment。"""
-
-        if not isinstance(item, (SystemMessageItem, UserMessageItem, AssistantMessageItem)):
-            return item
-        if not any(isinstance(part, ContextImagePart) for part in item.parts):
-            return item
-
-        text_parts = tuple(
-            ContextTextPart(IMAGE_TEXT_PLACEHOLDER) if isinstance(part, ContextImagePart) else part
-            for part in item.parts
-        )
-        if isinstance(item, AssistantMessageItem):
-            return replace(item, parts=text_parts, replay=None)
-        return replace(item, parts=text_parts)
-
-    return [rebuild_item_with_text_images(item) for item in items]
+    return [
+        _rebuild_item_with_image_transform(item, lambda _: ContextTextPart(IMAGE_TEXT_PLACEHOLDER)) for item in items
+    ]
 
 
 def compress_messages(items: list[ContextItem], img_target_size: int = 1 * 1024 * 1024) -> list[ContextItem]:
@@ -172,28 +183,15 @@ def compress_messages(items: list[ContextItem], img_target_size: int = 1 * 1024 
 
         return base64_data
 
-    def rebuild_item_with_compressed_images(item: ContextItem) -> ContextItem:
-        """重建含图片的消息 Item，并只清除被修改 Item 自身的 replay fragment。"""
+    def compress_image_part(part: ContextImagePart) -> ContextImagePart:
+        """压缩单个图片片段。"""
 
-        if not isinstance(item, (SystemMessageItem, UserMessageItem, AssistantMessageItem)):
-            return item
-        if not any(isinstance(part, ContextImagePart) for part in item.parts):
-            return item
-
-        compressed_parts = tuple(
-            ContextImagePart(
-                image_format=part.image_format,
-                image_base64=compress_base64_image(part.image_base64, target_size=img_target_size),
-            )
-            if isinstance(part, ContextImagePart)
-            else part
-            for part in item.parts
+        return ContextImagePart(
+            image_format=part.image_format,
+            image_base64=compress_base64_image(part.image_base64, target_size=img_target_size),
         )
-        if isinstance(item, AssistantMessageItem):
-            return replace(item, parts=compressed_parts, replay=None)
-        return replace(item, parts=compressed_parts)
 
-    return [rebuild_item_with_compressed_images(item) for item in items]
+    return [_rebuild_item_with_image_transform(item, compress_image_part) for item in items]
 
 
 class LLMUsageRecorder:
