@@ -25,6 +25,7 @@ from src.common.data_models.message_component_data_model import (
     TextComponent,
     VoiceComponent,
 )
+from src.common.logger import get_logger
 from src.llm_models.payload_content.context_item import (
     AssistantMessageItem,
     ContextItem,
@@ -41,10 +42,19 @@ from src.llm_models.payload_content.context_item import (
 )
 from src.llm_models.payload_content.tool_option import ToolCall
 
+logger = get_logger("maisaka_context_messages")
+
 FORWARD_PREVIEW_LIMIT = 4
 FOCUS_COOLDOWN_WAKEUP_SOURCE = "focus_cooldown_wakeup"
 FOCUS_AT_WAKEUP_SOURCE = "focus_at_wakeup"
 FOCUS_WAKEUP_SOURCE_KINDS = frozenset({FOCUS_COOLDOWN_WAKEUP_SOURCE, FOCUS_AT_WAKEUP_SOURCE})
+
+# 视觉模型对单张图片单边像素的限制（请求含 15 张及以上图片时降为 4096，这里按最低限制处理）。
+MAISAKA_IMAGE_MAX_SIDE = 4096
+# 长宽比超过该值时对长边进行分割，避免超长/超宽图被视觉接口拒绝。
+MAISAKA_IMAGE_ASPECT_RATIO_LIMIT = 3.0
+# 分割段之间的重叠像素，避免文字在分割边界被切断（按一般字体大小 16px 的 1.5 倍处理）。
+MAISAKA_IMAGE_SEGMENT_OVERLAP = 24
 
 
 def _guess_image_format(image_bytes: bytes) -> Optional[str]:
@@ -58,6 +68,94 @@ def _guess_image_format(image_bytes: bytes) -> Optional[str]:
         return None
 
 
+def _normalize_maisaka_image(image_bytes: bytes, image_format: str) -> list[tuple[str, str]]:
+    """将 Maisaka 链路（规划器/回复器）的图片规范化为视觉模型可接受的图片列表。
+
+    处理流程：
+    1. 检查比例：长宽比超过 3:1 的，对长边进行分割（超长图沿高度切，超宽图沿宽度切），
+       每段最长边不超过 4096，段间保留少量重叠避免文字被切断。
+    2. 检查尺寸：对单边超过 4096 的图片（含分割后仍超限的）进行等比例缩放。
+
+    返回 `(image_format, image_base64)` 列表，调用方应在同一个 user 块内逐张追加。
+    """
+    try:
+        with PILImage.open(BytesIO(image_bytes)) as image:
+            image_format = (image.format or image_format or "").lower()
+            if image_format in {"jpg", "jpeg"}:
+                image_format = "jpeg"
+
+            # 动图保持原逻辑（下游会转首帧），不做分割/缩放。
+            if getattr(image, "is_animated", False):
+                return [(image_format, base64.b64encode(image_bytes).decode("utf-8"))]
+
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return [(image_format, base64.b64encode(image_bytes).decode("utf-8"))]
+
+            aspect_ratio = max(width, height) / min(width, height)
+            if aspect_ratio > MAISAKA_IMAGE_ASPECT_RATIO_LIMIT:
+                segments = _split_maisaka_image(image, width, height)
+            else:
+                segments = [image.copy()]
+
+            normalized_segments: list[tuple[str, str]] = []
+            for segment in segments:
+                segment = _resize_maisaka_image(segment)
+                output_buffer = BytesIO()
+                if segment.mode in ("RGBA", "LA", "P"):
+                    segment = segment.convert("RGB")
+                segment.save(output_buffer, format="JPEG", quality=95, optimize=True)
+                normalized_segments.append(("jpeg", base64.b64encode(output_buffer.getvalue()).decode("utf-8")))
+
+            return normalized_segments
+    except Exception as exc:
+        logger.warning(f"Maisaka 图片规范化失败，保持原图发送: {exc}")
+        return [(image_format, base64.b64encode(image_bytes).decode("utf-8"))]
+
+
+def _split_maisaka_image(image: PILImage.Image, width: int, height: int) -> list[PILImage.Image]:
+    """沿长边将超长/超宽图分割为多段，每段最长边不超过 4096，段间保留重叠。"""
+
+    if width >= height:
+        # 超宽图：沿宽度方向分割
+        segment_length = MAISAKA_IMAGE_MAX_SIDE
+        segments: list[PILImage.Image] = []
+        start = 0
+        while start < width:
+            end = min(start + segment_length, width)
+            segments.append(image.crop((start, 0, end, height)))
+            if end >= width:
+                break
+            start = end - MAISAKA_IMAGE_SEGMENT_OVERLAP
+        return segments
+
+    # 超长图：沿高度方向分割
+    segment_length = MAISAKA_IMAGE_MAX_SIDE
+    segments = []
+    start = 0
+    while start < height:
+        end = min(start + segment_length, height)
+        segments.append(image.crop((0, start, width, end)))
+        if end >= height:
+            break
+        start = end - MAISAKA_IMAGE_SEGMENT_OVERLAP
+    return segments
+
+
+def _resize_maisaka_image(image: PILImage.Image) -> PILImage.Image:
+    """将单边超过 4096 的图片等比例缩放到限制内。"""
+
+    width, height = image.size
+    max_side = max(width, height)
+    if max_side <= MAISAKA_IMAGE_MAX_SIDE:
+        return image
+
+    scale = MAISAKA_IMAGE_MAX_SIDE / max_side
+    new_width = max(1, int(width * scale))
+    new_height = max(1, int(height * scale))
+    return image.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+
+
 def _append_emoji_component(
     builder: ContextItemBuilder,
     component: EmojiComponent,
@@ -68,7 +166,8 @@ def _append_emoji_component(
     image_format = _guess_image_format(component.binary_data)
     if enable_visual_message and image_format and component.binary_data:
         builder.add_text_content("[消息类型]表情包")
-        builder.add_image_content(image_format, base64.b64encode(component.binary_data).decode("utf-8"))
+        for sub_format, sub_base64 in _normalize_maisaka_image(component.binary_data, image_format):
+            builder.add_image_content(sub_format, sub_base64)
         return True
 
     normalized_content = component.content.strip()
@@ -89,7 +188,8 @@ def _append_image_component(
     """将图片组件追加到 LLM 消息构建器。"""
     image_format = _guess_image_format(component.binary_data)
     if enable_visual_message and image_format and component.binary_data:
-        builder.add_image_content(image_format, base64.b64encode(component.binary_data).decode("utf-8"))
+        for sub_format, sub_base64 in _normalize_maisaka_image(component.binary_data, image_format):
+            builder.add_image_content(sub_format, sub_base64)
         return True
 
     normalized_content = component.content.strip()
@@ -264,9 +364,7 @@ def _render_components_for_browser(
     for component in components:
         if isinstance(component, ForwardNodeComponent):
             nested_path = [*parent_path, nested_component_index]
-            rendered_parts.append(
-                f"[嵌套转发消息，path={nested_path}，可再次调用 view_forward_message 展开]"
-            )
+            rendered_parts.append(f"[嵌套转发消息，path={nested_path}，可再次调用 view_forward_message 展开]")
             nested_component_index += 1
             continue
 
