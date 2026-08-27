@@ -59,7 +59,7 @@ from src.llm_models.payload_content.tool_option import (
     ToolOption,
     normalize_tool_options,
 )
-from src.llm_models.utils import compress_messages, llm_usage_recorder
+from src.llm_models.utils import compress_messages, llm_usage_recorder, replace_images_with_text
 
 install(extra_lines=3)
 
@@ -71,6 +71,8 @@ DATA_URI_LIMIT_PATTERN = re.compile(
 )
 DATA_URI_RETRY_MARGIN_BYTES = 128 * 1024
 MIN_COMPRESSED_IMAGE_TARGET_SIZE_BYTES = 512 * 1024
+UNSUPPORTED_IMAGE_PATTERN = re.compile(r"unsupported image", re.IGNORECASE)
+"""识别视觉接口拒绝图片的错误关键词。"""
 EMPTY_TASK_FALLBACKS = {
     "expression_use": "utils",
     "learner": "utils",
@@ -205,6 +207,15 @@ class LLMOrchestrator:
                 return None
 
         return None
+
+    @staticmethod
+    def _is_unsupported_image_error(error: RespNotOkException) -> bool:
+        """判断错误是否为视觉接口拒绝图片（400 unsupported image）。"""
+        candidate_messages = [error.message, str(error)]
+        if error.__cause__ is not None:
+            candidate_messages.append(str(error.__cause__))
+
+        return any(UNSUPPORTED_IMAGE_PATTERN.search(candidate_message) for candidate_message in candidate_messages)
 
     @staticmethod
     def _build_data_uri_retry_target_size(limit_bytes: int) -> int:
@@ -1041,6 +1052,23 @@ class LLMOrchestrator:
                     # 压缩消息本身不消耗重试次数
                     compressed_messages = compress_messages(active_request.context_items)
                     active_request = active_request.copy_with(context_items=compressed_messages)
+                    update_failed_request_attempt(e, status="retrying")
+                    continue
+
+                # 特殊处理 400 unsupported image：将当前请求中的图片降级为纯文本后重试。
+                # 仅对 maisaka 规划器/回复器链路生效，且只对原始请求做一次兜底。
+                if (
+                    e.status_code == 400
+                    and self.request_type.startswith("maisaka.")
+                    and can_retry_with_compression
+                    and self._is_unsupported_image_error(e)
+                ):
+                    logger.warning(
+                        f"任务 '{task_display}' 的模型 '{model_info.name}' 返回 400 unsupported image，"
+                        f"尝试将图片降级为纯文本后重试..."
+                    )
+                    text_messages = replace_images_with_text(active_request.context_items)
+                    active_request = active_request.copy_with(context_items=text_messages)
                     update_failed_request_attempt(e, status="retrying")
                     continue
 

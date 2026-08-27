@@ -13,6 +13,7 @@ from src.llm_models.payload_content.context_item import (
     AssistantMessageItem,
     ContextImagePart,
     ContextItem,
+    ContextTextPart,
     SystemMessageItem,
     UserMessageItem,
 )
@@ -20,6 +21,38 @@ from src.llm_models.payload_content.context_item import (
 from .model_client.base_client import UsageRecord
 
 logger = get_logger("消息压缩工具")
+
+IMAGE_TEXT_PLACEHOLDER = "[图片]"
+"""图片被替换为纯文本时的占位符。"""
+
+
+def replace_images_with_text(items: list[ContextItem]) -> list[ContextItem]:
+    """将消息列表中的图片片段替换为纯文本占位符。
+
+    当视觉接口拒绝图片（如 400 unsupported image）时，将当前请求中的图片
+    降级为文本占位符后重试；旧上下文（历史消息）仍维持多模态。
+
+    :param items: 消息列表
+    :return: 图片被替换为文本占位符后的消息列表
+    """
+
+    def rebuild_item_with_text_images(item: ContextItem) -> ContextItem:
+        """重建含图片的消息 Item，并只清除被修改 Item 自身的 replay fragment。"""
+
+        if not isinstance(item, (SystemMessageItem, UserMessageItem, AssistantMessageItem)):
+            return item
+        if not any(isinstance(part, ContextImagePart) for part in item.parts):
+            return item
+
+        text_parts = tuple(
+            ContextTextPart(IMAGE_TEXT_PLACEHOLDER) if isinstance(part, ContextImagePart) else part
+            for part in item.parts
+        )
+        if isinstance(item, AssistantMessageItem):
+            return replace(item, parts=text_parts, replay=None)
+        return replace(item, parts=text_parts)
+
+    return [rebuild_item_with_text_images(item) for item in items]
 
 
 def compress_messages(items: list[ContextItem], img_target_size: int = 1 * 1024 * 1024) -> list[ContextItem]:
