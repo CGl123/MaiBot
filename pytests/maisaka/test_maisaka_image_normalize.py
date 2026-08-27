@@ -147,3 +147,29 @@ def test_extreme_tall_image_falls_back_to_scaling() -> None:
     assert max(decoded.size) <= MAISAKA_IMAGE_MAX_SIDE
     # 整体缩放保持长宽比：宽度 = 4096 * (700 / 54000) ≈ 53
     assert abs(decoded.size[0] / decoded.size[1] - 700 / 54000) < 0.01
+
+
+def test_rgba_image_flattened_to_white_background() -> None:
+    """RGBA 透明图应合成到白色背景上，透明区域为白色而非黑色。"""
+
+    image = Image.new("RGBA", (100, 100), (255, 0, 0, 0))  # 全透明红色
+    segments = _normalize_maisaka_image(_image_bytes(image, "PNG"), "png")
+
+    assert len(segments) == 1
+    decoded = _decode_segments(segments)[0]
+    assert decoded.mode == "RGB"
+    # 透明区域合成到白色背景后应为白色
+    assert decoded.getpixel((50, 50)) == (255, 255, 255)
+
+
+def test_palette_image_with_transparency_flattened() -> None:
+    """含 transparency 信息的 P 模式图片应合成到白色背景上。"""
+
+    image = Image.new("P", (100, 100))
+    image.info["transparency"] = 0
+    image.putpalette([255, 0, 0, 0, 255, 0, 0, 0, 255] + [0, 0, 0] * 253)
+    segments = _normalize_maisaka_image(_image_bytes(image, "PNG"), "png")
+
+    assert len(segments) == 1
+    decoded = _decode_segments(segments)[0]
+    assert decoded.mode == "RGB"

@@ -7,6 +7,7 @@ from enum import Enum
 from io import BytesIO
 from typing import Any, Optional, Sequence
 import base64
+import math
 import uuid
 
 from PIL import Image as PILImage
@@ -96,14 +97,22 @@ def _normalize_maisaka_image(image_bytes: bytes, image_format: str) -> list[tupl
 
             aspect_ratio = max(width, height) / min(width, height)
             if aspect_ratio > MAISAKA_IMAGE_ASPECT_RATIO_LIMIT:
-                segments = _split_maisaka_image(image, width, height)
-                # 极长图片分割段数过多时，改为整体缩放，避免产生过多分段。
-                if len(segments) > MAISAKA_IMAGE_MAX_SEGMENTS:
+                # 先计算预计分段数，超过上限时直接整体缩放，避免为极长图创建大量裁剪对象。
+                long_side = max(width, height)
+                step = MAISAKA_IMAGE_MAX_SIDE - MAISAKA_IMAGE_SEGMENT_OVERLAP
+                segment_count = (
+                    1
+                    if long_side <= MAISAKA_IMAGE_MAX_SIDE
+                    else math.ceil((long_side - MAISAKA_IMAGE_MAX_SIDE) / step) + 1
+                )
+                if segment_count > MAISAKA_IMAGE_MAX_SEGMENTS:
                     logger.info(
-                        f"Maisaka 图片分割段数 {len(segments)} 超过上限 {MAISAKA_IMAGE_MAX_SEGMENTS}，"
+                        f"Maisaka 图片预计分段数 {segment_count} 超过上限 {MAISAKA_IMAGE_MAX_SEGMENTS}，"
                         f"改为整体缩放: {width}x{height}"
                     )
                     segments = [_resize_maisaka_image(image)]
+                else:
+                    segments = _split_maisaka_image(image, width, height)
             else:
                 segments = [image.copy()]
 
@@ -111,8 +120,7 @@ def _normalize_maisaka_image(image_bytes: bytes, image_format: str) -> list[tupl
             for segment in segments:
                 segment = _resize_maisaka_image(segment)
                 output_buffer = BytesIO()
-                if segment.mode in ("RGBA", "LA", "P", "I;16"):
-                    segment = segment.convert("RGB")
+                segment = _flatten_maisaka_image(segment)
                 segment.save(output_buffer, format="JPEG", quality=95, optimize=True)
                 normalized_segments.append(("jpeg", base64.b64encode(output_buffer.getvalue()).decode("utf-8")))
 
@@ -163,6 +171,23 @@ def _resize_maisaka_image(image: PILImage.Image) -> PILImage.Image:
     new_width = max(1, int(width * scale))
     new_height = max(1, int(height * scale))
     return image.resize((new_width, new_height), PILImage.Resampling.LANCZOS)
+
+
+def _flatten_maisaka_image(image: PILImage.Image) -> PILImage.Image:
+    """将带透明通道的图片合成到白色背景上，返回可保存为 JPEG 的 RGB 图。
+
+    对 RGBA、LA 以及含 transparency 信息的 P 模式图片，使用白色背景与 alpha
+    mask 合成，避免直接 convert("RGB") 丢弃透明度导致透明区域变黑。
+    """
+
+    if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+        alpha_image = image.convert("RGBA")
+        background = PILImage.new("RGB", alpha_image.size, (255, 255, 255))
+        background.paste(alpha_image, mask=alpha_image.getchannel("A"))
+        return background
+    if image.mode in ("I;16", "I", "F"):
+        return image.convert("RGB")
+    return image.convert("RGB")
 
 
 def _append_emoji_component(
